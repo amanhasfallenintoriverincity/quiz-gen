@@ -4,6 +4,10 @@ from flask import Flask, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from google import genai
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Initialize Flask
 app = Flask(__name__)
