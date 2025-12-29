@@ -1,7 +1,9 @@
 import os
 import json
-from flask import Flask, jsonify, request
+import random
+from flask import Flask, jsonify
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy.sql.expression import func
 from google import genai
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
@@ -50,7 +52,7 @@ def generate_single_quiz_question(topic):
         )
         
         response = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-2.0-flash',
             contents=prompt,
             config={
                 'response_mime_type': 'application/json',
@@ -74,7 +76,7 @@ def generate_single_quiz_question(topic):
 def index():
     return jsonify({
         "status": "ok",
-        "message": "Welcome to the AI Quiz API",
+        "message": "Welcome to the AI Quiz API (Random Selection + Auto-Growth)",
         "endpoints": {
             "quiz": "/quiz"
         }
@@ -82,62 +84,101 @@ def index():
 
 @app.route('/quiz')
 def get_quiz():
-    # Default topic context for the broad subject
-    # We use a fixed key 'Information_AI' for the DB to pool all questions together, 
-    # or we can accept ?topic= from query string if needed.
-    # Given the request to "remove <topic> part", I will default to a general "Information Subject" context.
-    
     TOPIC_KEY = "Information_Subject_AI"
     DISPLAY_TOPIC = "정보 교과 및 인공지능 (Information Subject & AI)"
-    
     REQUIRED_COUNT = 5
-    result_questions = []
     
-    # 1. Fetch available questions from DB
-    available_questions = Question.query.filter(
-        Question.topic == TOPIC_KEY,
-        Question.usage_count < 5
-    ).order_by(Question.usage_count.asc()).limit(REQUIRED_COUNT).all()
+    # 1. Fetch 5 Random questions from DB (regardless of usage_count)
+    # SQLite uses func.random(), PostgreSQL uses func.random(), MySQL uses func.rand()
+    # SQLAlchemy's func.random() usually maps correctly for SQLite.
+    result_db_questions = Question.query.filter(
+        Question.topic == TOPIC_KEY
+    ).order_by(func.random()).limit(REQUIRED_COUNT).all()
     
-    # Add existing questions to result
-    for q in available_questions:
+    result_data = []
+    
+    # Add fetched questions to response list
+    for q in result_db_questions:
         q.usage_count += 1
-        result_questions.append({
+        result_data.append({
             "source": "database",
             "id": q.id,
             "quiz": q.data
         })
+
+    # 2. Logic to add new questions periodically or if not enough exist
+    # Condition A: If we retrieved fewer than 5 questions, we MUST generate more to fill the gap.
+    # Condition B: Even if we have 5, with 30% chance, generate 1 new question to grow the DB pool.
     
-    # 2. If we need more questions, generate them individually
-    needed_count = REQUIRED_COUNT - len(result_questions)
+    needed_count = REQUIRED_COUNT - len(result_data)
     
-    for _ in range(needed_count):
-        print(f"Generating question {_ + 1} of {needed_count} via Gemini API...")
+    # If we have enough questions, check probability to add a new one anyway (Growth)
+    if needed_count == 0 and random.random() < 0.3:
+        print("Triggering random AI generation to grow database pool...")
+        needed_count = 1
+        # Note: We won't necessarily append this to the *current response* if we already have 5,
+        # unless you want the user to see the brand new one immediately. 
+        # Let's replace one random existing question with the new one for freshness, 
+        # or just add it to DB silently. 
+        # Strategy: Add it to DB. If we are just growing, we don't strictly need to return it, 
+        # but returning it ensures the user sees new content. Let's append/replace.
+        # However, for simplicity, I'll just add it to the DB.
+        
+        # Actually, to make the code simpler: 
+        # I will generate 'needed_count' (gap filler) normally.
+        # PLUS, I will run a separate single generation step if the probability hits, 
+        # but only save it to DB, not necessarily affecting the response count unless needed.
+    
+    # Let's stick to: "Ensure we return 5". If we generated extra for growth, we save them.
+    
+    questions_to_generate = needed_count
+    
+    # If gap is 0, maybe generate 1 for growth
+    is_growth_generation = False
+    if questions_to_generate == 0 and random.random() < 0.3:
+        questions_to_generate = 1
+        is_growth_generation = True
+
+    newly_generated_items = []
+
+    for _ in range(questions_to_generate):
+        print("Generating new question via AI...")
         q_data = generate_single_quiz_question(DISPLAY_TOPIC)
         
         if q_data:
             new_q = Question(
                 topic=TOPIC_KEY,
                 data=q_data,
-                usage_count=1
+                usage_count=0 # New question
             )
             db.session.add(new_q)
             db.session.flush() # Get ID
             
-            result_questions.append({
+            item = {
                 "source": "ai_generated",
                 "id": new_q.id,
                 "quiz": q_data
-            })
-        else:
-            pass
+            }
             
+            # If this was strictly needed to fill the quota, add to results
+            # If it was growth, we can choose to swap it in or just let it sit in DB.
+            # Let's swap it in to show the user the new content immediately!
+            if is_growth_generation:
+                if len(result_data) >= REQUIRED_COUNT:
+                    result_data.pop() # Remove one old one
+                result_data.append(item)
+            else:
+                result_data.append(item)
+    
     db.session.commit()
     
+    # Ensure we limit to 5 just in case logic got messy
+    final_response = result_data[:REQUIRED_COUNT]
+
     return jsonify({
         "topic": TOPIC_KEY,
-        "count": len(result_questions),
-        "questions": result_questions
+        "count": len(final_response),
+        "questions": final_response
     })
 
 if __name__ == '__main__':
